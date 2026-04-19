@@ -41,7 +41,7 @@ const db = {
 // ─────────────────────────────────────────────────────────────
 const livekit = {
   // Token publisher (creator — può pubblicare audio/video)
-  publisherToken(creatorId, roomName) {
+  async publisherToken(creatorId, roomName) {
     const at = new AccessToken(CONFIG.LIVEKIT_API_KEY, CONFIG.LIVEKIT_API_SECRET, {
       identity: creatorId,
       ttl: '4h',
@@ -53,11 +53,11 @@ const livekit = {
       canSubscribe:   false,
       canPublishData: true,
     });
-    return at.toJwt();
+    return await at.toJwt();
   },
 
   // Token viewer (solo subscribe)
-  viewerToken(roomName) {
+  async viewerToken(roomName) {
     const identity = `viewer-${crypto.randomUUID().substring(0, 8)}`;
     const at = new AccessToken(CONFIG.LIVEKIT_API_KEY, CONFIG.LIVEKIT_API_SECRET, {
       identity,
@@ -69,7 +69,7 @@ const livekit = {
       canPublish:   false,
       canSubscribe: true,
     });
-    return at.toJwt();
+    return await at.toJwt();
   },
 
   // Verifica stanza via Room Service API
@@ -216,7 +216,7 @@ const server = http.createServer(async (req, res) => {
     // Genera token LiveKit per il creator (publisher)
     let livekitToken;
     try {
-      livekitToken = livekit.publisherToken(creatorId, id);
+      livekitToken = await livekit.publisherToken(creatorId, id);
     } catch (e) {
       return respond(res, { error: 'Errore generazione token LiveKit: ' + e.message }, 500);
     }
@@ -293,7 +293,7 @@ const server = http.createServer(async (req, res) => {
 
     let viewerToken = null;
     if (session.status === 'LIVE') {
-      try { viewerToken = livekit.viewerToken(session.id); } catch {}
+      try { viewerToken = await livekit.viewerToken(session.id); } catch {}
     }
 
     return respond(res, {
