@@ -1,13 +1,11 @@
 {
   "name": "candiddd-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "CANDIDDD.live — Backend API + WebSocket",
-  "main": "server.js",
+  "main": "candiddd-server.js",
   "scripts": {
-    "start":   "node server.js",
-    "dev":     "LIVEKIT_API_KEY=${LIVEKIT_API_KEY} LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET} LIVEKIT_URL=${LIVEKIT_URL} node server.js",
-    "test":    "bash ../test-candiddd.sh",
-    "setup":   "npm install && echo 'Pronto. Configura .env poi: npm start'"
+    "start": "node candiddd-server.js",
+    "dev": "node candiddd-server.js"
   },
   "dependencies": {
     "livekit-server-sdk": "^2.6.0"
