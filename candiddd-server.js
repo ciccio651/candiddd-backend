@@ -8,6 +8,7 @@
 // ── Dipendenze ────────────────────────────────────────────────
 // npm install livekit-server-sdk @fastify/cors
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
+const { Pool } = require('pg');
 const http    = require('http');
 const { EventEmitter } = require('events');
 const crypto  = require('crypto');
@@ -25,7 +26,36 @@ const CONFIG = {
 };
 
 // ─────────────────────────────────────────────────────────────
-// IN-MEMORY DB (sviluppo) — sostituire con Postgres in produzione
+// POSTGRESQL — connessione persistente
+// ─────────────────────────────────────────────────────────────
+let pool = null;
+
+async function getDb() {
+  if (!pool) {
+    if (!process.env.DATABASE_URL) {
+      console.warn('[DB] DATABASE_URL non configurata — uso RAM');
+      return null;
+    }
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 5,
+      idleTimeoutMillis: 30000,
+    });
+    try {
+      await pool.query('SELECT 1');
+      console.log('[DB] ✅ PostgreSQL connesso');
+    } catch (e) {
+      console.error('[DB] Errore connessione:', e.message);
+      pool = null;
+      return null;
+    }
+  }
+  return pool;
+}
+
+// ─────────────────────────────────────────────────────────────
+// IN-MEMORY DB (fallback se DB non disponibile) (sviluppo) — sostituire con Postgres in produzione
 // ─────────────────────────────────────────────────────────────
 const db = {
   sessions:   new Map(),  // id → session
@@ -117,31 +147,6 @@ function emitToAll(sessionId, evt) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// RATE LIMITING — max 5 sessioni per IP al minuto
-// ─────────────────────────────────────────────────────────────
-const rateLimitMap = new Map();
-
-function checkRateLimit(ip, maxRequests = 5, windowMs = 60000) {
-  const now = Date.now();
-  const entry = rateLimitMap.get(ip) || { count: 0, resetAt: now + windowMs };
-  if (now > entry.resetAt) {
-    entry.count = 0;
-    entry.resetAt = now + windowMs;
-  }
-  entry.count++;
-  rateLimitMap.set(ip, entry);
-  return entry.count <= maxRequests;
-}
-
-// Pulizia rate limit map ogni 5 minuti
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, entry] of rateLimitMap.entries()) {
-    if (now > entry.resetAt) rateLimitMap.delete(ip);
-  }
-}, 5 * 60 * 1000);
-
-// ─────────────────────────────────────────────────────────────
 // ANTI-FRODE
 // ─────────────────────────────────────────────────────────────
 function fraudCheck(userId, amount) {
@@ -181,15 +186,10 @@ function respond(res, data, status = 200) {
   res.end(JSON.stringify(data));
 }
 
-async function readBody(req, maxBytes = 65536) {
+async function readBody(req) {
   return new Promise((resolve) => {
     let data = '';
-    let size = 0;
-    req.on('data', chunk => {
-      size += chunk.length;
-      if (size > maxBytes) { req.destroy(); resolve({}); return; }
-      data += chunk;
-    });
+    req.on('data', chunk => data += chunk);
     req.on('end', () => {
       try { resolve(JSON.parse(data)); } catch { resolve({}); }
     });
@@ -234,10 +234,6 @@ const server = http.createServer(async (req, res) => {
 
   // ── POST /api/creator/live-sessions ─────────────────────
   if (method === 'POST' && path === '/api/creator/live-sessions') {
-    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
-    if (!checkRateLimit(ip)) {
-      return respond(res, req, { error: 'Troppo richieste. Riprova tra un minuto.' }, 429);
-    }
     const { level = 'CASA', mission_id = null, geo_lat, geo_lng, creator_name, creator_city } = body;
 
     const validLevels = ['CASA','ROUTINE','SOCIALE','LOCALE','CITTADINO','REGIONALE','NAZIONALE','GLOBALE'];
@@ -278,6 +274,19 @@ const server = http.createServer(async (req, res) => {
 
     db.sessions.set(id, session);
 
+    // Salva su PostgreSQL
+    try {
+      const dbConn = await getDb();
+      if (dbConn) {
+        await dbConn.query(
+          `INSERT INTO live_sessions (id, creator_name, creator_city, status, level, livekit_room, playback_url, geo_lat, geo_lng, start_time)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          [id, session.creator_name, session.creator_city, 'LIVE', level,
+           id, session.playback_url, geo_lat||null, geo_lng||null, now]
+        );
+      }
+    } catch(e) { console.error('[DB] Insert error:', e.message); }
+
     // Notifica WS: live_started
     emitToAll(id, { type: 'live_started', payload: { session_id: id, creator_id: creatorId, start_time: now, level } });
 
@@ -315,6 +324,17 @@ const server = http.createServer(async (req, res) => {
     session.status   = 'ENDED';
     session.end_time = now;
 
+    // Aggiorna su PostgreSQL
+    try {
+      const dbConn2 = await getDb();
+      if (dbConn2) {
+        await dbConn2.query(
+          'UPDATE live_sessions SET status=$1, end_time=$2, viewer_count=$3 WHERE id=$4',
+          ['ENDED', now, session.viewer_count, sessionId]
+        );
+      }
+    } catch(e) { console.error('[DB] Update error:', e.message); }
+
     emitToAll(sessionId, { type: 'live_ended', payload: { session_id: sessionId, end_time: now, duration_seconds: durationSec } });
 
     console.log(`[SESSION] Ended: ${sessionId} — duration: ${durationSec}s`);
@@ -350,6 +370,22 @@ const server = http.createServer(async (req, res) => {
 
   // ── GET /api/live-sessions (lista live attive) ────────────
   if (method === 'GET' && path === '/api/live-sessions') {
+    // Leggi da PostgreSQL se disponibile
+    try {
+      const dbConn3 = await getDb();
+      if (dbConn3) {
+        const result = await dbConn3.query(
+          "SELECT id, creator_name, creator_city, level, playback_url, viewer_count, start_time FROM live_sessions WHERE status='LIVE' ORDER BY start_time DESC"
+        );
+        // Ripristina sessioni in RAM dal DB (utile dopo restart)
+        for (const row of result.rows) {
+          if (!db.sessions.has(row.id)) {
+            db.sessions.set(row.id, { ...row, status: 'LIVE', creator_id: 'db-restored', end_time: null, earnings_eur: 0 });
+          }
+        }
+        return respond(res, req, { live_sessions: result.rows, total: result.rows.length });
+      }
+    } catch(e) { console.error('[DB] List error:', e.message); }
     const active = [];
     for (const [, s] of db.sessions) {
       if (s.status === 'LIVE') active.push({ id: s.id, creator_id: s.creator_id, creator_name: s.creator_name || 'Creator', creator_city: s.creator_city || '', level: s.level, playback_url: s.playback_url, viewer_count: s.viewer_count, start_time: s.start_time });
@@ -760,9 +796,6 @@ async function notifyWorkerAction(sessionId, action) {
 // ─────────────────────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────────────────────
-server.timeout = 30000;
-server.requestTimeout = 15000;
-
 server.listen(CONFIG.PORT, () => {
   console.log('');
   console.log('╔══════════════════════════════════════════╗');
@@ -798,4 +831,3 @@ server.listen(CONFIG.PORT, () => {
 
 process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
 process.on('SIGINT',  () => { server.close(() => process.exit(0)); });
-
