@@ -1,6 +1,6 @@
 {
   "name": "candiddd-backend",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "CANDIDDD.live — Backend API + WebSocket",
   "main": "candiddd-server.js",
   "scripts": {
@@ -8,7 +8,8 @@
     "dev": "node candiddd-server.js"
   },
   "dependencies": {
-    "livekit-server-sdk": "^2.6.0"
+    "livekit-server-sdk": "^2.6.0",
+    "pg": "^8.11.0"
   },
   "engines": {
     "node": ">=18.0.0"
