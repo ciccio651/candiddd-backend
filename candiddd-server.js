@@ -6,6 +6,8 @@
 
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
 const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt    = require('jsonwebtoken');
 const http   = require('http');
 const crypto = require('crypto');
 
@@ -24,6 +26,7 @@ const CONFIG = {
   ADMIN_KEY:          requireEnv('ADMIN_KEY'),
   ALLOWED_ORIGIN:     process.env.ALLOWED_ORIGIN || 'https://candiddd.live',
   WORKER_URL:         process.env.WORKER_URL || 'http://localhost:4000',
+  JWT_SECRET:         process.env.JWT_SECRET || 'candiddd-jwt-fallback',
 };
 
 // ─── POSTGRESQL ───────────────────────────────────────────────
@@ -93,6 +96,23 @@ const livekit = {
     return await at.toJwt();
   },
 };
+
+// ─── AUTH HELPERS ─────────────────────────────────────────────
+function generateToken(creator) {
+  return jwt.sign(
+    { id: creator.id, email: creator.email, name: creator.name },
+    CONFIG.JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+}
+
+async function verifyToken(req) {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.replace('Bearer ', '').trim();
+  if (!token) return null;
+  try { return jwt.verify(token, CONFIG.JWT_SECRET); }
+  catch { return null; }
+}
 
 // ─── WEBSOCKET ────────────────────────────────────────────────
 const wsRooms = new Map();
@@ -183,6 +203,67 @@ const server = http.createServer(async (req, res) => {
   const viewerId  = req.headers['x-viewer-id']  || 'viewer-' + Date.now();
   const isAdmin   = (req.headers['x-admin-key'] || '') === CONFIG.ADMIN_KEY;
 
+  // POST /api/auth/register
+  if (method === 'POST' && path === '/api/auth/register') {
+    const { name, email, password, city } = body;
+    if (!name || !email || !password) return respond(res, origin, { error: 'Nome, email e password obbligatori' }, 400);
+    if (password.length < 6) return respond(res, origin, { error: 'Password minimo 6 caratteri' }, 400);
+
+    const dbConn = await getDb();
+    if (!dbConn) return respond(res, origin, { error: 'Database non disponibile' }, 500);
+
+    try {
+      // Controlla se email già usata
+      const existing = await dbConn.query('SELECT id FROM creators WHERE email=$1', [email.toLowerCase()]);
+      if (existing.rows.length > 0) return respond(res, origin, { error: 'Email già registrata' }, 409);
+
+      const hash = await bcrypt.hash(password, 10);
+      const result = await dbConn.query(
+        'INSERT INTO creators (name, email, password_hash, city, level, status) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, name, email, city, level',
+        [name.trim(), email.toLowerCase(), hash, city || '', 'BASE', 'ACTIVE']
+      );
+      const creator = result.rows[0];
+      const token = generateToken(creator);
+      console.log('[AUTH] Nuovo creator:', creator.email);
+      return respond(res, origin, { ok: true, token, creator: { id: creator.id, name: creator.name, email: creator.email, city: creator.city, level: creator.level } }, 201);
+    } catch(e) {
+      console.error('[AUTH] Register error:', e.message);
+      return respond(res, origin, { error: 'Errore registrazione' }, 500);
+    }
+  }
+
+  // POST /api/auth/login
+  if (method === 'POST' && path === '/api/auth/login') {
+    const { email, password } = body;
+    if (!email || !password) return respond(res, origin, { error: 'Email e password obbligatori' }, 400);
+
+    const dbConn = await getDb();
+    if (!dbConn) return respond(res, origin, { error: 'Database non disponibile' }, 500);
+
+    try {
+      const result = await dbConn.query('SELECT * FROM creators WHERE email=$1 AND status=$2', [email.toLowerCase(), 'ACTIVE']);
+      if (result.rows.length === 0) return respond(res, origin, { error: 'Credenziali non valide' }, 401);
+
+      const creator = result.rows[0];
+      const valid = await bcrypt.compare(password, creator.password_hash);
+      if (!valid) return respond(res, origin, { error: 'Credenziali non valide' }, 401);
+
+      const token = generateToken(creator);
+      console.log('[AUTH] Login:', creator.email);
+      return respond(res, origin, { ok: true, token, creator: { id: creator.id, name: creator.name, email: creator.email, city: creator.city, level: creator.level } });
+    } catch(e) {
+      console.error('[AUTH] Login error:', e.message);
+      return respond(res, origin, { error: 'Errore login' }, 500);
+    }
+  }
+
+  // GET /api/auth/me
+  if (method === 'GET' && path === '/api/auth/me') {
+    const decoded = await verifyToken(req);
+    if (!decoded) return respond(res, origin, { error: 'Non autorizzato' }, 401);
+    return respond(res, origin, { ok: true, creator: decoded });
+  }
+
   // GET /api/health
   if (method === 'GET' && path === '/api/health') {
     const dbOk = !!(await getDb().catch(() => null));
@@ -199,7 +280,12 @@ const server = http.createServer(async (req, res) => {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
     if (!checkRateLimit(ip)) return respond(res, origin, { error: 'Troppo richieste. Riprova tra un minuto.' }, 429);
 
+    // Verifica JWT se presente, altrimenti usa X-Creator-Id (retrocompatibilità)
+    const decoded = await verifyToken(req);
     const { level = 'CASA', geo_lat, geo_lng, creator_name, creator_city } = body;
+    const authCreatorName = decoded?.name || creator_name;
+    const authCreatorCity = decoded?.city || creator_city;
+    const authCreatorId   = decoded?.id   || req.headers['x-creator-id'] || 'demo-creator';
     const validLevels = ['CASA','ROUTINE','SOCIALE','LOCALE','CITTADINO','REGIONALE','NAZIONALE','GLOBALE'];
     if (!validLevels.includes(level)) return respond(res, origin, { error: 'Level non valido' }, 400);
 
@@ -207,13 +293,13 @@ const server = http.createServer(async (req, res) => {
     const now = new Date().toISOString();
 
     let livekitToken;
-    try { livekitToken = await livekit.publisherToken(creatorId, id); }
+    try { livekitToken = await livekit.publisherToken(authCreatorId, id); }
     catch (e) { return respond(res, origin, { error: 'Errore token LiveKit: ' + e.message }, 500); }
 
     const session = {
-      id, creator_id: creatorId, status: 'LIVE', level,
-      creator_name: creator_name || 'Creator',
-      creator_city: creator_city || '',
+      id, creator_id: authCreatorId, status: 'LIVE', level,
+      creator_name: authCreatorName || 'Creator',
+      creator_city: authCreatorCity || '',
       stream_key:   `sk_${creatorId.substring(0,8)}_${Date.now()}`,
       playback_url: `https://candiddd.live/live/${id}`,
       geo_lat: geo_lat || null, geo_lng: geo_lng || null,
